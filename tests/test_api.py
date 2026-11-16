@@ -170,11 +170,11 @@ class APITests(unittest.TestCase):
 
     def test_exit_needs_login_and_submission_then_correction_notifies_only_affected_student(self):
         self.swipe(clock="08:55:00")
-        self.assertEqual(self.swipe(mode="exit", clock="11:55:00")[0], 400)  # entry not yet confirmed
+        self.assertEqual(self.swipe(mode="exit", clock="10:15:00")[0], 400)  # entry not yet confirmed
         student = Client(self.base)
         student.login_link(self.code_for("24C1001"))
         student.request("/student/confirm", "POST", {})
-        self.assertEqual(self.swipe(mode="exit", clock="11:55:00")[0], 200)
+        self.assertEqual(self.swipe(mode="exit", clock="10:15:00")[0], 200)
         record = next(r for r in student.request("/student/data")[1]["records"] if r["lesson_id"] == self.lesson["id"])
         self.assertEqual((record["first_status"], record["second_status"], record["exit_at"]), ("present", "present", None))
         self.assertEqual(student.request("/student/submit-exit", "POST", {})[0], 400)  # entry login cannot submit an exit
@@ -267,7 +267,7 @@ class APITests(unittest.TestCase):
         student["email"] = "updated@example.edu"
         self.assertEqual(self.client.request("/admin/students", "PUT", student)[0], 200)
         course = {"name": "テスト科目", "code": "TEST101", "teacher": "テスト教員", "room": "C101", "year": 2027,
-                  "start_date": "2027-04-01", "weeks": 15, "first_start": "09:00", "first_end": "10:30", "second_start": "10:40", "second_end": "12:10", "student_ids": ["TEST001"]}
+                  "start_date": "2027-04-01", "weeks": 15, "first_start": "09:00", "first_end": "09:45", "second_start": "09:45", "second_end": "10:30", "student_ids": ["TEST001"]}
         self.assertEqual(self.client.request("/admin/courses", "POST", course)[0], 200)
         data = self.client.request("/admin/data")[1]
         cid = next(c["id"] for c in data["courses"] if c["code"] == "TEST101")

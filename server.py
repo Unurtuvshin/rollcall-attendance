@@ -157,9 +157,9 @@ def seed(db):
     db.executemany("INSERT INTO students VALUES(?,?,?,?,?)", people)
     today = now().date()
     for index, (name, code, room, offset, times) in enumerate([
-        ("ソフトウェア工学", "CS301", "A棟 302", 0, ("09:00", "10:30", "10:40", "12:10")),
-        ("データベース", "CS204", "B棟 201", 0, ("13:00", "14:30", "14:40", "16:10")),
-        ("情報ネットワーク", "CS302", "A棟 405", 1, ("09:00", "10:30", "10:40", "12:10"))], 1):
+        ("ソフトウェア工学", "CS301", "A棟 302", 0, ("09:00", "09:45", "09:45", "10:30")),
+        ("データベース", "CS204", "B棟 201", 0, ("13:00", "13:45", "13:45", "14:30")),
+        ("情報ネットワーク", "CS302", "A棟 405", 1, ("09:00", "09:45", "09:45", "10:30"))], 1):
         db.execute("INSERT INTO courses VALUES(?,?,?,?,?,?)", (index, name, code, "山田 太郎", room, today.year))
         for person in people:
             db.execute("INSERT INTO enrollments VALUES(?,?)", (person[0], index))
@@ -723,7 +723,7 @@ class Handler(SimpleHTTPRequestHandler):
                 year = int(data.get("year", now().year))
                 require(2000 <= year <= 2100, "年度を確認してください。")
                 times = [text_field(data, k, 5) for k in ("first_start", "first_end", "second_start", "second_end")]
-                require(all(re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", t) for t in times) and all(a < b for a, b in zip(times, times[1:])), "2コマの開始・終了時刻を順番に設定してください。")
+                require(all(re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", t) for t in times) and times[0] < times[1] <= times[2] < times[3], "2コマの開始・終了時刻を順番に設定してください（1コマ目の終了と2コマ目の開始は同じ時刻でも構いません）。")
                 require(all(datetime.strptime(times[i+1], "%H:%M")-datetime.strptime(times[i], "%H:%M") >= timedelta(minutes=30) for i in (0, 2)), "各コマは30分以上にしてください。")
                 day = datetime.strptime(text_field(data, "start_date", 10), "%Y-%m-%d").date()
                 count = int(data.get("weeks", 15))

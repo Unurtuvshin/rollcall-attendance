@@ -1,4 +1,4 @@
-"""Attendance rules transcribed from the supplied two-period decision table."""
+"""Attendance rules for one lesson split into two parts (e.g. 45 + 45 minutes); late/early leave apply to each part."""
 from datetime import datetime, timedelta
 
 STATUSES = ("present", "late", "absent", "early", "excused")
