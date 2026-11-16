@@ -2,6 +2,7 @@
 import http.cookiejar
 import json
 import os
+import re
 import tempfile
 import threading
 import time
@@ -31,8 +32,8 @@ class Client:
         except urllib.error.HTTPError as error:
             return error.code, json.loads(error.read())
 
-    def login_otp(self, code):
-        result = self.request("/auth/otp", "POST", {"code": code})
+    def login_link(self, token):
+        result = self.request("/auth/link", "POST", {"token": token})
         if result[0] == 200:
             self.csrf = self.request("/bootstrap")[1]["user"]["csrf"]
         return result
@@ -81,23 +82,21 @@ class APITests(unittest.TestCase):
             db.execute("DELETE FROM records WHERE lesson_id IN (SELECT id FROM lessons WHERE day>=?)", (server.now().date().isoformat(),))
             self.lesson = server.one(db, "SELECT * FROM lessons WHERE day=? ORDER BY first_start LIMIT 1", (server.now().date().isoformat(),))
 
-    def swipe(self, sid="24C1001", mode="entry", clock="09:05:00", event_id=None, otp=None):
+    def swipe(self, sid="24C1001", mode="entry", clock="09:05:00", event_id=None):
         body = {"event_id": event_id or f"test-{time.time_ns()}", "student_id": sid, "lesson_id": self.lesson["id"],
                 "mode": mode, "occurred_at": self.lesson["day"] + "T" + clock + "+09:00"}
-        if otp:
-            body["otp"] = otp
         return self.client.request("/integrations/card-events", "POST", body, {"Authorization": "Bearer " + "a" * 40})
 
     def code_for(self, sid):
         with server.database() as db:
-            message = server.one(db, "SELECT body FROM mail WHERE student_id=? AND kind='otp' ORDER BY id DESC LIMIT 1", (sid,))
-        return message["body"].split("認証コード：")[1][:6]
+            message = server.one(db, "SELECT body FROM mail WHERE student_id=? AND kind='login' ORDER BY id DESC LIMIT 1", (sid,))
+        return re.search(r"#login=([\w-]{43})", message["body"]).group(1)
 
     def test_full_student_flow_uses_card_time_and_only_own_data(self):
         self.assertEqual(self.swipe()[0], 200)
         self.assertEqual(self.swipe("24C1002", clock="09:00:00")[0], 200)
         code = self.code_for("24C1001")
-        self.assertEqual(self.client.login_otp(code)[0], 200)
+        self.assertEqual(self.client.login_link(code)[0], 200)
         data = self.client.request("/student/data?student_id=24C1002")[1]
         self.assertEqual({r["student_id"] for r in data["records"]}, {"24C1001"})
         self.assertEqual({m["student_id"] for m in data["mail"]}, {"24C1001"})
@@ -112,44 +111,49 @@ class APITests(unittest.TestCase):
         self.assertEqual(len(notices), 1)
         self.client.request("/student/confirm", "POST", {})
         self.assertEqual(len([m for m in self.client.request("/student/data")[1]["mail"] if m["kind"] == "confirmation"]), 1)
-        self.assertEqual(Client(self.base).login_otp(code)[0], 401)
+        self.assertEqual(Client(self.base).login_link(code)[0], 401)
 
-    def test_otp_expiry_and_rate_limit(self):
+    def test_link_expiry_and_rate_limit(self):
         self.swipe()
-        code = self.code_for("24C1001")
+        token = self.code_for("24C1001")
         with server.database() as db:
             db.execute("UPDATE challenges SET expires_at=?", (time.time()-1,))
-        self.assertEqual(self.client.login_otp(code)[0], 401)
-        for _ in range(server.OTP_FAILURES - 1):  # the expired code above was already failure number one
-            self.assertEqual(self.client.login_otp("000000")[0], 401)
-        self.assertEqual(self.client.login_otp("000000")[0], 429)
+        self.assertEqual(self.client.login_link(token)[0], 401)
+        for _ in range(server.LINK_FAILURES - 1):  # the expired link above was already failure number one
+            self.assertEqual(self.client.login_link("A" * 43)[0], 401)
+        self.assertEqual(self.client.login_link("A" * 43)[0], 429)
 
-    def test_otp_lives_five_minutes_and_successes_do_not_count_toward_limit(self):
-        self.swipe(otp="123456")
+    def test_link_is_long_random_lives_ten_minutes_and_logins_do_not_count_toward_limit(self):
+        self.swipe()
+        token = self.code_for("24C1001")
+        self.assertEqual(len(token), 43)
         with server.database() as db:
             life = db.execute("SELECT expires_at-? FROM challenges", (time.time(),)).fetchone()[0]
-        self.assertTrue(250 < life <= 300, life)
-        for i in range(server.OTP_FAILURES + 5):  # many students log in from the one reader PC
-            self.swipe(otp=f"{200000 + i}")
-            self.assertEqual(Client(self.base).login_otp(f"{200000 + i}")[0], 200)
+        self.assertTrue(550 < life <= 600, life)
+        for _ in range(server.LINK_FAILURES + 5):  # many students log in from the one reader PC
+            self.swipe()
+            self.assertEqual(Client(self.base).login_link(self.code_for("24C1001"))[0], 200)
 
-    def test_unconfirmed_scan_becomes_absent_after_lesson_ends(self):
+    def test_login_only_from_school_network(self):
         self.swipe()
-        def summary(shift):
-            with patch.object(server, "now", lambda: datetime.fromisoformat(self.lesson["day"] + "T" + shift + "+09:00")):
-                with server.database() as db:
-                    record = next(r for r in server.history_rows(db, "24C1001")[0] if r["lesson_id"] == self.lesson["id"])
-                    return record["confirmed"], record["first_status"], server.absence_summary(db, "24C1001", self.lesson["course_id"])["absent"]
-        self.assertEqual(summary("11:00:00")[0], 0)
-        confirmed, first, absent = summary("23:59:00")
-        self.assertEqual((confirmed, first), (1, "absent"))
-        self.assertGreaterEqual(absent, 2)
+        token = self.code_for("24C1001")
+        with patch.dict(os.environ, {"ALLOWED_NETWORKS": "10.0.0.0/8, 192.168.0.0/16"}):
+            result = self.client.login_link(token)
+            self.assertEqual(result[0], 403)
+        with patch.dict(os.environ, {"ALLOWED_NETWORKS": "10.0.0.0/8, 127.0.0.0/8"}):
+            self.assertEqual(self.client.login_link(token)[0], 200)  # the refused try did not use the link up
+            self.assertEqual(self.client.request("/student/data")[0], 200)
+        with patch.dict(os.environ, {"ALLOWED_NETWORKS": "10.0.0.0/8"}):  # an existing session also stops working off-network
+            self.assertEqual(self.client.request("/student/data")[0], 403)
 
-    def test_repeat_entry_reissues_code_without_rewriting_card_time(self):
-        self.assertEqual(self.swipe(clock="09:00:00", otp="132465")[0], 200)
-        self.assertEqual(self.swipe(clock="10:00:00", otp="867459")[0], 200)
-        self.assertEqual(self.client.login_otp("132465")[0], 401)
-        self.assertEqual(self.client.login_otp("867459")[0], 200)
+    def test_repeat_entry_reissues_link_without_rewriting_card_time(self):
+        self.assertEqual(self.swipe(clock="09:00:00")[0], 200)
+        first = self.code_for("24C1001")
+        self.assertEqual(self.swipe(clock="10:00:00")[0], 200)
+        second = self.code_for("24C1001")
+        self.assertNotEqual(first, second)
+        self.assertEqual(self.client.login_link(first)[0], 401)
+        self.assertEqual(self.client.login_link(second)[0], 200)
         self.client.request("/student/confirm", "POST", {})  # unconfirmed scans turn absent once the lesson is over
         data = self.client.request("/student/data")[1]
         record = next(r for r in data["records"] if r["lesson_id"] == self.lesson["id"])
@@ -168,14 +172,14 @@ class APITests(unittest.TestCase):
         self.swipe(clock="08:55:00")
         self.assertEqual(self.swipe(mode="exit", clock="11:55:00")[0], 400)  # entry not yet confirmed
         student = Client(self.base)
-        student.login_otp(self.code_for("24C1001"))
+        student.login_link(self.code_for("24C1001"))
         student.request("/student/confirm", "POST", {})
         self.assertEqual(self.swipe(mode="exit", clock="11:55:00")[0], 200)
         record = next(r for r in student.request("/student/data")[1]["records"] if r["lesson_id"] == self.lesson["id"])
         self.assertEqual((record["first_status"], record["second_status"], record["exit_at"]), ("present", "present", None))
         self.assertEqual(student.request("/student/submit-exit", "POST", {})[0], 400)  # entry login cannot submit an exit
         leaver = Client(self.base)
-        self.assertEqual(leaver.login_otp(self.code_for("24C1001"))[0], 200)
+        self.assertEqual(leaver.login_link(self.code_for("24C1001"))[0], 200)
         self.assertEqual(leaver.request("/student/confirm", "POST", {})[0], 400)  # exit login cannot re-confirm entry
         self.assertEqual(leaver.request("/student/submit-exit", "POST", {})[0], 200)
         record = next(r for r in student.request("/student/data")[1]["records"] if r["lesson_id"] == self.lesson["id"])
@@ -192,7 +196,7 @@ class APITests(unittest.TestCase):
 
     def test_usage_log_lists_scan_login_and_confirmation(self):
         self.swipe()
-        self.client.login_otp(self.code_for("24C1001"))
+        self.client.login_link(self.code_for("24C1001"))
         self.client.request("/student/confirm", "POST", {})
         actions = [u["action"] for u in self.client.request("/student/data")[1]["usage"]]
         for expected in ("カード読取（入室）", "ログイン", "出席手続き"):
@@ -203,7 +207,7 @@ class APITests(unittest.TestCase):
             skipped = server.one(db, "SELECT l.* FROM lessons l WHERE l.course_id=? AND l.day<? ORDER BY l.day LIMIT 1", (self.lesson["course_id"], self.lesson["day"]))
             db.execute("DELETE FROM records WHERE student_id='24C1001' AND lesson_id=?", (skipped["id"],))
         self.swipe()
-        self.client.login_otp(self.code_for("24C1001"))
+        self.client.login_link(self.code_for("24C1001"))
         self.client.request("/student/confirm", "POST", {})
         body = next(m for m in self.client.request("/student/data")[1]["mail"] if m["kind"] == "confirmation")["body"]
         self.assertIn(f"{skipped['day']}  1コマ目：欠席 / 2コマ目：欠席", body)
@@ -218,7 +222,7 @@ class APITests(unittest.TestCase):
             ids = [r["id"] for r in db.execute("SELECT r.id FROM records r JOIN lessons l ON l.id=r.lesson_id WHERE r.student_id='24C1001' AND l.course_id=? AND l.day<? ORDER BY l.day LIMIT 3", (cid, self.lesson["day"]))]
             db.executemany("UPDATE records SET first_auto='absent',second_auto='absent' WHERE id=?", [(i,) for i in ids])
         self.swipe(clock="12:00:00")  # absent for both periods: 6 + 2 of a 9-period limit
-        self.client.login_otp(self.code_for("24C1001"))
+        self.client.login_link(self.code_for("24C1001"))
         self.client.request("/student/confirm", "POST", {})
         self.client.request("/student/confirm", "POST", {})
         warnings = [m for m in self.client.request("/student/data")[1]["mail"] if m["kind"] == "warning"]
@@ -235,25 +239,26 @@ class APITests(unittest.TestCase):
             db.execute("UPDATE lessons SET second_end=? WHERE id=?", (end, self.lesson["id"]))
         try:
             self.swipe()
-            self.assertEqual(self.client.login_otp(self.code_for("24C1001"))[0], 200)
+            self.assertEqual(self.client.login_link(self.code_for("24C1001"))[0], 200)
             left = self.client.request("/bootstrap")[1]["user"]["expires_at"] - time.time()
             self.assertTrue(1300 < left < 1600, left)  # 40 minutes to the end, minus 15 (and the dropped seconds)
         finally:
             with server.database() as db:
                 db.execute("UPDATE lessons SET second_end=? WHERE id=?", (original, self.lesson["id"]))
 
-    def test_external_otp_card_mapping_replay_and_rollback(self):
+    def test_card_mapping_replay_and_rollback(self):
         payload = {"event_id": "external-001", "card_id": "CARD-003", "lesson_id": self.lesson["id"], "mode": "entry",
-                   "occurred_at": self.lesson["day"]+"T09:00:00+09:00", "otp": "753102"}
+                   "occurred_at": self.lesson["day"]+"T09:00:00+09:00"}
         headers = {"Authorization": "Bearer " + "a" * 40}
         first = self.client.request("/integrations/card-events", "POST", payload, headers)
         second = self.client.request("/integrations/card-events", "POST", payload, headers)
         self.assertEqual(first, second)
-        self.assertNotIn("otp", first[1])
-        self.assertEqual(self.client.login_otp("753102")[0], 200)
+        self.assertNotIn("token", json.dumps(first[1]))
+        self.assertEqual(self.client.login_link(self.code_for("24C1003"))[0], 200)
         self.assertEqual(self.client.request("/bootstrap")[1]["user"]["id"], "24C1003")
-        self.assertEqual(self.swipe("24C1004", otp="123")[0], 400)
-        self.assertEqual(self.swipe("24C1004")[0], 200)  # invalid OTP must not leave a partial entry
+        bad = {**payload, "event_id": "external-002", "card_id": "CARD-004", "occurred_at": "not a time"}
+        self.assertEqual(self.client.request("/integrations/card-events", "POST", bad, headers)[0], 400)
+        self.assertEqual(self.swipe("24C1004")[0], 200)  # the failed event must not leave a partial entry
 
     def test_administrator_and_year_setup_crud(self):
         self.client.login_admin()

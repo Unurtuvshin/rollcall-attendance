@@ -2,6 +2,7 @@
 """Rollcall — a dependency-free local prototype with a real SQLite/API boundary."""
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import re
@@ -30,6 +31,7 @@ JST = timezone(timedelta(hours=9))  # fixed offset: no DST, and Windows lacks tz
 DEMO = os.getenv("DEMO_MODE", "1") == "1"
 HOST = os.getenv("HOST", "127.0.0.1")
 PORT = int(os.getenv("PORT", "3000"))
+PUBLIC_URL = os.getenv("PUBLIC_URL", f"http://{HOST}:{PORT}").rstrip("/")  # base of the login link in the mail
 DB_PATH = Path(os.getenv("DATABASE_PATH", str(ROOT / "data" / "rollcall.sqlite3")))
 LOCK = threading.RLock()
 RATE = {}
@@ -204,8 +206,8 @@ def enqueue(db, student_id, subject, body, kind):
                (student_id, student["email"], subject, body, kind, stamp(), "local" if DEMO else "queued"))
 
 
-OTP_SECONDS = 300   # a short life leaves little time to guess another student's 6-digit code
-OTP_FAILURES = 10   # wrong codes per minute per IP before login is paused
+LINK_SECONDS = 600  # how long a login link works; it is random and single use
+LINK_FAILURES = 10  # bad links per minute per IP before login is paused
 SESSION_MIN = 600  # seconds a login lasts at least, even when the scan is within 15 minutes of the lesson's end
 WARN_REMAINING = 2  # warn when this many absent periods (or fewer) are left before the limit
 LIMIT_DIVISOR = 3   # absence limit = one third of the course's periods (assumed; adjust to the school's rule)
@@ -281,9 +283,23 @@ def notify_record(db, record_id, subject, kind):
     enqueue(db, record["student_id"], subject, content + "\nRollcall 出席管理", kind)
 
 
-def otp_hash(db, code):
+def token_hash(db, code):
     key = one(db, "SELECT value FROM settings WHERE key='otp_secret'")["value"]
     return hmac.new(key.encode(), code.encode(), hashlib.sha256).hexdigest()
+
+
+def school_networks():
+    return [ipaddress.ip_network(n.strip(), strict=False) for n in os.getenv("ALLOWED_NETWORKS", "").split(",") if n.strip()]
+
+
+def on_school_network(ip):
+    """True when ip is inside ALLOWED_NETWORKS. Without that setting only the local demo is open to everyone."""
+    networks = school_networks()
+    if not networks:
+        return DEMO
+    address = ipaddress.ip_address(ip.split("%")[0])
+    address = getattr(address, "ipv4_mapped", None) or address
+    return any(address in network for network in networks)
 
 
 class APIError(Exception):
@@ -302,27 +318,19 @@ def text_field(data, key, limit=120):
     return value.strip()
 
 
-def issue_otp(db, student_id, record_id, purpose, data, occurred):
-    """One code per card scan: it logs the student in for exactly this lesson record and purpose."""
-    code = data.get("otp")
-    if code is None:
-        for _ in range(30):
-            candidate = f"{secrets.randbelow(1000000):06}"
-            if not one(db, "SELECT id FROM challenges WHERE code_hash=? AND used=0 AND expires_at>?", (otp_hash(db, candidate), time.time())):
-                code = candidate
-                break
-    require(isinstance(code, str) and re.fullmatch(r"\d{6}", code), "認証コードは6桁の数字にしてください。")
-    require(not one(db, "SELECT id FROM challenges WHERE code_hash=? AND used=0 AND expires_at>?", (otp_hash(db, code), time.time())),
-            "そのコードは使用中です。新しいコードを指定してください。")
+def issue_link(db, student_id, record_id, purpose, occurred):
+    """One random link per card scan: it logs the student in for exactly this lesson record and purpose."""
+    token = secrets.token_urlsafe(32)  # 43 characters, 256 bits: cannot be guessed
     db.execute("UPDATE challenges SET used=1 WHERE student_id=? AND used=0", (student_id,))
     db.execute("INSERT INTO challenges(student_id,record_id,code_hash,expires_at,purpose) VALUES(?,?,?,?,?)",
-               (student_id, record_id, otp_hash(db, code), time.time() + OTP_SECONDS, purpose))
-    if not data.get("otp") or DEMO:  # sent to the student's school (Microsoft 365) address
-        record = get_record(db, record_id)
-        what = "出席手続き" if purpose == "entry" else "退室（早退）の手続き"
-        enqueue(db, student_id, "出席確認の認証コード" if purpose == "entry" else "退室手続きの認証コード",
-                f"認証コード：{code}\n\n{record['course_name']} の{what}用です。\n有効期限は{OTP_SECONDS // 60}分です。\n"
-                f"カード読取：{occurred.strftime('%Y/%m/%d %H:%M:%S')}\n\nRollcall 出席管理", "otp")
+               (student_id, record_id, token_hash(db, token), time.time() + LINK_SECONDS, purpose))
+    record = get_record(db, record_id)
+    what = "出席手続き" if purpose == "entry" else "退室（早退）の手続き"
+    # The token is in the URL fragment, so it never reaches server logs or Referer headers, and mail scanners that only fetch the page cannot use it up.
+    enqueue(db, student_id, "出席確認のログインリンク" if purpose == "entry" else "退室手続きのログインリンク",
+            f"{record['course_name']} の{what}用のログインリンクです。\n学内ネットワークで、次のリンクを開いてください。\n\n"
+            f"{PUBLIC_URL}/#login={token}\n\n有効期限は{LINK_SECONDS // 60}分で、1回しか使えません。他の人に送らないでください。\n"
+            f"カード読取：{occurred.strftime('%Y/%m/%d %H:%M:%S')}\n\nRollcall 出席管理", "login")
 
 
 def event(db, data):
@@ -352,7 +360,6 @@ def event(db, data):
         require(-60 <= (now() - occurred).total_seconds() <= 300, "カード読取時刻が受付範囲外です。")
     record = one(db, "SELECT * FROM records WHERE student_id=? AND lesson_id=?", (student_id, lesson["id"]))
     mode = data.get("mode")
-    code = None
     if mode == "entry":
         repeated_entry = bool(record and record["entry_at"])
         if repeated_entry:
@@ -366,8 +373,8 @@ def event(db, data):
             first, second = entry_status(lesson, occurred)
             record_id = db.execute("INSERT INTO records(student_id,lesson_id,entry_at,first_auto,second_auto,updated_at) VALUES(?,?,?,?,?,?)",
                                    (student_id, lesson["id"], occurred.isoformat(), first, second, stamp())).lastrowid
-        issue_otp(db, student_id, record_id, "entry", data, occurred)
-        result = {"record_id": record_id, "message": "入室時刻を維持し、認証コードを再発行しました。" if repeated_entry else "入室を記録し、認証コードを受け付けました。"}
+        issue_link(db, student_id, record_id, "entry", occurred)
+        result = {"record_id": record_id, "message": "入室時刻を維持し、ログインリンクを再送しました。" if repeated_entry else "入室を記録し、ログインリンクを送りました。"}
     elif mode == "exit":
         require(record and record["entry_at"], "先に入室カードを読み取ってください。")
         require(record["confirmed"], "先に出席手続きを完了してください。")
@@ -376,14 +383,14 @@ def event(db, data):
         exit_status(lesson, datetime.fromisoformat(record["entry_at"]), datetime.fromisoformat(pending))  # validates order
         record_id = record["id"]
         db.execute("UPDATE records SET pending_exit_at=?,updated_at=? WHERE id=?", (pending, stamp(), record_id))
-        issue_otp(db, student_id, record_id, "exit", data, occurred)
-        result = {"record_id": record_id, "message": "退室を記録しました。認証コードでログインし、退室を提出してください。"}
+        issue_link(db, student_id, record_id, "exit", occurred)
+        result = {"record_id": record_id, "message": "退室を記録しました。メールのログインリンクを開き、退室を提出してください。"}
     else:
         raise APIError("mode は entry または exit にしてください。")
     course = one(db, "SELECT name FROM courses WHERE id=?", (lesson["course_id"],))["name"]
     usage(db, student_id, "カード読取（入室）" if mode == "entry" else "カード読取（退室）", f"{course} / {occurred.strftime('%Y/%m/%d %H:%M:%S')}")
     audit(db, "card-reader", "入室" if mode == "entry" else "退室", f"{student_id} / 授業 {lesson['id']} / {occurred.isoformat()}")
-    # Never retain plaintext codes in the replay log or return them from integration APIs.
+    # Never put login links in the replay log or return them from integration APIs.
     db.execute("INSERT INTO card_events VALUES(?,?)", (event_id, json.dumps(result)))
     return result
 
@@ -469,6 +476,8 @@ class Handler(SimpleHTTPRequestHandler):
             raise APIError("ログインしてください。", 401)
         if role and session["role"] != role:
             raise APIError("この操作は許可されていません。", 403)
+        if session["role"] == "student" and not on_school_network(self.client_address[0]):
+            raise APIError("学内ネットワークからのみ利用できます。", 403)
         table = "students" if session["role"] == "student" else "admins"
         user = one(db, f"SELECT id,name FROM {table} WHERE id=?", (session["user_id"],))
         if not user:
@@ -569,14 +578,16 @@ class Handler(SimpleHTTPRequestHandler):
             except APIError:
                 user = None
             return {"user": user, "demo": DEMO, "today": now().date().isoformat(), "now": stamp()}, None
-        if path == "/api/auth/otp" and method == "POST":
-            self.rate_limit("otp", OTP_FAILURES, record=False)  # only wrong codes count; many students log in from one PC
-            code = str(data.get("code", ""))
-            require(re.fullmatch(r"\d{6}", code), "6桁の認証コードを入力してください。")
-            challenge = one(db, "SELECT * FROM challenges WHERE code_hash=? AND used=0 AND expires_at>?", (otp_hash(db, code), time.time()))
+        if path == "/api/auth/link" and method == "POST":
+            if not on_school_network(self.client_address[0]):
+                raise APIError("学内ネットワークからのみ利用できます。", 403)
+            self.rate_limit("link", LINK_FAILURES, record=False)  # only bad links count; many students log in from one PC
+            token = str(data.get("token", ""))
+            require(re.fullmatch(r"[A-Za-z0-9_-]{43}", token), "ログインリンクが正しくありません。")
+            challenge = one(db, "SELECT * FROM challenges WHERE code_hash=? AND used=0 AND expires_at>?", (token_hash(db, token), time.time()))
             if not challenge:
-                self.rate_hit("otp")
-                raise APIError("認証コードが正しくないか、有効期限が切れています。", 401)
+                self.rate_hit("link")
+                raise APIError("ログインリンクが無効か、有効期限が切れています。カードをもう一度かざしてください。", 401)
             db.execute("UPDATE challenges SET used=1 WHERE id=?", (challenge["id"],))
             db.execute("DELETE FROM sessions WHERE expires_at<?", (time.time(),))
             record = get_record(db, challenge["record_id"])
@@ -614,7 +625,6 @@ class Handler(SimpleHTTPRequestHandler):
             if path == "/api/demo/event" and method == "POST":
                 self.rate_limit("demo", 30)
                 data["event_id"] = "demo-" + secrets.token_hex(12)
-                data.pop("otp", None)
                 return event(db, data), None
         if path == "/api/student/data" and method == "GET":
             session = self.auth(db, "student")
@@ -771,6 +781,10 @@ def main():
             raise RuntimeError("本番には32文字以上の INTEGRATION_TOKEN が必要です。")
         if not os.getenv("SMTP_HOST") or not os.getenv("SMTP_FROM"):
             raise RuntimeError("本番には SMTP_HOST と SMTP_FROM が必要です。")
+        if not school_networks():
+            raise RuntimeError("本番には学内ネットワークの ALLOWED_NETWORKS（例：192.168.0.0/16）が必要です。")
+        if not os.getenv("PUBLIC_URL"):
+            raise RuntimeError("本番にはメールのリンクに使う PUBLIC_URL（https://...）が必要です。")
         if os.getenv("SECURE_COOKIE") != "1":
             raise RuntimeError("本番ではHTTPSを使用し SECURE_COOKIE=1 を設定してください。")
     initialize()

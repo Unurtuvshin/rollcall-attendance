@@ -18,11 +18,11 @@ On Windows use `python` instead of `python3`. Config comes from env vars or a `.
 ## Architecture
 
 - `attendance.py` — pure, side-effect-free judgment of the two class periods (出席/遅刻/欠席/早退/公欠) from entry/exit times. It transcribes the course's decision table; boundaries are compared to the second and the end time itself counts as 早退. Change the rules here and in the README tables together.
-- `server.py` (single file, ~670 lines) — everything else: SQLite schema/seed (`initialize`, `seed`), the `Handler` (`SimpleHTTPRequestHandler` subclass that serves `public/` and routes `/api/*` in `do_GET/POST/PUT/DELETE`), sessions + CSRF + Origin checks, OTP (HMAC-stored, 5 min, single use), the card-event ingest `event()`, a background `mail_worker` draining the DB mail queue (SMTP only when `DEMO_MODE=0`; demo mode just stores mail in the local mailbox), and an `audit` trail.
+- `server.py` (single file, ~670 lines) — everything else: SQLite schema/seed (`initialize`, `seed`), the `Handler` (`SimpleHTTPRequestHandler` subclass that serves `public/` and routes `/api/*` in `do_GET/POST/PUT/DELETE`), sessions + CSRF + Origin checks, magic-link login (random 43-char token in the mailed `#login=` fragment, HMAC-stored, 10 min, single use, `ALLOWED_NETWORKS` CIDR check on login and student APIs), the card-event ingest `event()`, a background `mail_worker` draining the DB mail queue (SMTP only when `DEMO_MODE=0`; demo mode just stores mail in the local mailbox), and an `audit` trail.
 - `public/` — vanilla JS SPA (`app.js`, `index.html`, `style.css`), no framework or bundler.
 - `data/rollcall.sqlite3` — auto-created, git-ignored.
 
-Key flows that span files: a card reader (or the demo "カードリーダー" screen) posts to `/api/integrations/card-events` → `event()` records entry (and issues/validates the OTP) or exit → `attendance.entry_status/exit_status` computes status → `effective()` lets a teacher's manual override win over auto judgment → `notify_record()` queues mail to the single affected student. Entry time is fixed at the first scan; re-scanning "entry" only reissues the OTP. Events are idempotent on `event_id`.
+Key flows that span files: a card reader (or the demo "カードリーダー" screen) posts to `/api/integrations/card-events` → `event()` records entry (and mails the login link) or exit → `attendance.entry_status/exit_status` computes status → `effective()` lets a teacher's manual override win over auto judgment → `notify_record()` queues mail to the single affected student. Entry time is fixed at the first scan; re-scanning "entry" only resends the link. Events are idempotent on `event_id`.
 
 ## Conventions worth knowing
 
